@@ -1,5 +1,14 @@
 {
   "appId": "com.termux.pet",
   "appName": "PetApp",
-  "webDir": "www"
+  "webDir": "www",
+  "server": {
+    "androidScheme": "https",
+    "allowNavigation": ["*"]
+  },
+  "plugins": {
+    "Filesystem": {
+      "label": "PetApp"
+    }
+  }
 }

@@ -11,6 +11,8 @@
       background: transparent;
       overflow: hidden;
       touch-action: none;
+      -webkit-user-select: none;
+      user-select: none;
     }
     #canvas {
       position: fixed;
@@ -19,37 +21,40 @@
       cursor: grab;
       image-rendering: pixelated;
       image-rendering: crisp-edges;
+      filter: drop-shadow(0 4px 8px rgba(0,0,0,0.3));
     }
     #canvas:active { cursor: grabbing; }
     #debug {
       position: fixed;
-      top: 10px;
-      left: 10px;
+      top: 10px; left: 10px;
       color: white;
-      font: 12px monospace;
-      background: rgba(0,0,0,0.5);
+      font: 11px monospace;
+      background: rgba(0,0,0,0.6);
       padding: 4px 8px;
       border-radius: 4px;
       display: none;
+      pointer-events: none;
     }
   </style>
 </head>
 <body>
 <canvas id="canvas"></canvas>
-<div id="debug"></div>
+<div id="debug">loading...</div>
 
 <script>
 // ========== Config ==========
 const LOG_PATH = '/data/data/com.termux/files/home/.hermes/logs/agent.log';
 const SPRITE_PATH = 'img/spritesheet.png';
 
-// Sprite sheet: 1408x768, 3 rows
-// Row 1 & 2: 6 cells × 234×256
-// Row 3: 12 smaller cells × 117×256
+// Sprite sheet: 1408x768
+// Row 0 & 1: 6 cells × 234×256 (idle, thinking, angry, happy, working, swordplay | building, conducting, notice, sweeping, carrying, sleeping)
+// Row 2: 12 cells × 117×256 (walk cycle / dynamic actions)
 const CELL_W = 234, CELL_H = 256;
 const SMALL_W = 117;
 
 // State → (row, col) 0-indexed
+// row 0, 1: static poses (single frame)
+// row 2: animation sequences
 const STATE_MAP = {
   idle:      [0, 0],
   thinking:  [0, 1],
@@ -65,40 +70,45 @@ const STATE_MAP = {
   sleeping:  [1, 5],
 };
 
+// States that use row 2 walk cycle
+const WALK_STATES = new Set(['working', 'building', 'conducting', 'sweeping', 'carrying']);
+
 // ========== State ==========
 let currentState = 'idle';
 let frameIdx = 0;
-let animTimer = 0;
-let petX = 0, petY = 0;
-let dragging = false, dragOffX = 0, dragOffY = 0;
+let walkFrameIdx = 0;
 let lastActivity = Date.now();
 let lastSessionId = null;
+let thinkingPulse = 0;
 
 // ========== Canvas ==========
 const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
 const debug = document.getElementById('debug');
 
-// Scale: display at 50% of cell size (117×128 fits nicely)
-const SCALE = 0.5;
+// Scale: display at 60% of cell size (~140x154)
+const SCALE = 0.6;
 const DISP_W = Math.floor(CELL_W * SCALE);
 const DISP_H = Math.floor(CELL_H * SCALE);
 
 canvas.width = DISP_W;
 canvas.height = DISP_H;
 
-// Position bottom-right initially
-petX = window.innerWidth - DISP_W - 40;
-petY = window.innerHeight - DISP_H - 40;
+// Position bottom-right
+let petX = window.innerWidth - DISP_W - 40;
+let petY = window.innerHeight - DISP_H - 40;
+
+// Dragging
+let dragging = false, dragOffX = 0, dragOffY = 0;
 
 // ========== Sprite Sheet ==========
 const sheet = new Image();
-let frames = [];
-let framesSmall = [];
+let frames = [];       // row 0, 1 → 12 frames (234x256 each)
+let walkFrames = [];   // row 2 → 12 frames (117x256 each, scale to DISP_W)
 let loaded = false;
 
 sheet.onload = () => {
-  // Extract row 1 & 2 (6 cells each)
+  // Extract rows 0 & 1 (6 cells each = 12 frames)
   for (let row = 0; row < 2; row++) {
     for (let col = 0; col < 6; col++) {
       const c = document.createElement('canvas');
@@ -108,13 +118,14 @@ sheet.onload = () => {
       frames.push(c);
     }
   }
-  // Row 3: 12 smaller cells
+  // Extract row 2 walk cycle (12 cells, scale to DISP_W x DISP_H)
   for (let col = 0; col < 12; col++) {
     const c = document.createElement('canvas');
-    c.width = SMALL_W; c.height = CELL_H;
+    c.width = CELL_W; c.height = CELL_H;
     const cx = c.getContext('2d');
-    cx.drawImage(sheet, col * SMALL_W, 2 * CELL_H, SMALL_W, CELL_H, 0, 0, SMALL_W, CELL_H);
-    framesSmall.push(c);
+    // Small cell: 117x256, scale to match CELL_W
+    cx.drawImage(sheet, col * SMALL_W, 2 * CELL_H, SMALL_W, CELL_H, 0, 0, CELL_W, CELL_H);
+    walkFrames.push(c);
   }
   loaded = true;
   requestAnimationFrame(draw);
@@ -127,15 +138,51 @@ function draw() {
 
   ctx.clearRect(0, 0, DISP_W, DISP_H);
 
-  const [row, col] = STATE_MAP[currentState] || [0, 0];
-  let fi;
+  const [row] = STATE_MAP[currentState] || [0, 0];
+  ctx.imageSmoothingEnabled = false;
+
   if (row < 2) {
-    fi = row * 6 + col;
-    ctx.imageSmoothingEnabled = false;
+    // Static pose from rows 0/1
+    const fi = row * 6 + (STATE_MAP[currentState] || [0, 0])[1];
     ctx.drawImage(frames[fi], 0, 0, DISP_W, DISP_H);
+
+    // Thinking pulse effect
+    if (currentState === 'thinking') {
+      thinkingPulse += 0.08;
+      const scale = 1 + Math.sin(thinkingPulse) * 0.05;
+      // Draw a small indicator
+      ctx.save();
+      ctx.globalAlpha = 0.7;
+      ctx.fillStyle = '#ffcc00';
+      const dotX = DISP_W - 20;
+      const dotY = 15 + Math.sin(thinkingPulse * 2) * 3;
+      ctx.beginPath();
+      ctx.arc(dotX, dotY, 4, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+  } else {
+    // Walk cycle from row 2
+    ctx.drawImage(walkFrames[walkFrameIdx], 0, 0, DISP_W, DISP_H);
   }
 
   requestAnimationFrame(draw);
+}
+
+// ========== Walk cycle animation ==========
+let lastWalkUpdate = 0;
+const WALK_INTERVAL = 150; // ms between walk frames
+
+function updateWalk(ts) {
+  if (!loaded) return;
+  if (WALK_STATES.has(currentState)) {
+    if (ts - lastWalkUpdate > WALK_INTERVAL) {
+      lastWalkUpdate = ts;
+      walkFrameIdx = (walkFrameIdx + 1) % 12;
+    }
+  } else {
+    walkFrameIdx = 0;
+  }
 }
 
 // ========== Drag ==========
@@ -160,75 +207,108 @@ function updatePos() {
   canvas.style.top = petY + 'px';
 }
 
-// ========== Log Polling ==========
-const LOG_POLL_MS = 2000;
-let lastLogPos = 0;
+// ========== Log Polling via Capacitor bridge ==========
+let pollInterval = null;
+
+function startPolling() {
+  if (pollInterval) return;
+  // Capacitor: use android.webkit.CookieManager or define a JS interface
+  // Fallback: use polling via a custom URL scheme
+  pollInterval = setInterval(pollLog, 2000);
+}
 
 async function pollLog() {
   try {
-    const resp = await fetch('file://' + LOG_PATH);
-    if (!resp.ok) return;
-    const text = await resp.text();
-    const lines = text.split('\n');
-    
-    // Find last session ID and state
-    let lastLine = '';
-    for (let i = lines.length - 1; i >= 0; i--) {
-      if (lines[i].includes('[') && lines[i].includes(']')) {
-        lastLine = lines[i];
-        break;
+    // Try Capacitor Filesystem API if available
+    // For now use NativeModule bridge
+    const result = await new Promise(resolve => {
+      // Check if in Capacitor
+      if (window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.Filesystem) {
+        window.Capacitor.Plugins.Filesystem.readFile({ path: LOG_PATH, encoding: 'utf8' })
+          .then(r => resolve(r.data))
+          .catch(() => resolve(''));
+      } else {
+        resolve('');
       }
-    }
+    });
 
-    if (lastLine.includes('gateway.start')) {
-      const m = lastLine.match(/\[([a-z0-9]+)\]/);
-      if (m) lastSessionId = m[1];
-    }
-    if (lastLine.includes('gateway.exit_clean')) {
-      currentState = 'sleeping';
-    }
-    if (lastLine.includes('conversation turn:') || lastLine.includes('API call #')) {
-      currentState = 'thinking';
-      lastActivity = Date.now();
-    }
-    if (lastLine.includes('tool_executor:')) {
-      currentState = 'working';
-      lastActivity = Date.now();
-    }
-    if (lastLine.includes('Turn ended:')) {
-      currentState = 'happy';
-      lastActivity = Date.now();
-    }
-
-    // Idle -> sleeping after 2 min
-    if (Date.now() - lastActivity > 120000 && currentState !== 'sleeping') {
-      currentState = 'sleeping';
-    }
-
-    // Update debug
-    debug.style.display = 'block';
-    debug.textContent = `${currentState} | ${(lastSessionId || 'none').slice(0,8)}`;
+    if (!result) return;
+    processLog(result);
   } catch (e) {
-    // fetch may fail on file://, ignore
+    // silent
   }
 }
 
-// ========== Animation Tick ==========
-function tick() {
-  animTimer++;
-  // Advance frame every ~1s for multi-frame states
-  const delays = { sleeping: 60, thinking: 40, working: 15, happy: 30, idle: 30 };
-  const delay = delays[currentState] || 30;
-  if (animTimer >= delay) {
-    animTimer = 0;
-    // Currently just redraws (single frame per state)
-    // Could add row-3 walk cycle animation here
+function processLog(text) {
+  const lines = text.split('\n');
+  let lastValid = '';
+
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const l = lines[i].trim();
+    if (l && l.includes('[') && l.includes(']')) {
+      lastValid = l;
+      break;
+    }
   }
-  pollLog();
-  setTimeout(tick, 1000);
+
+  if (!lastValid) return;
+
+  // Detect session
+  const sidMatch = lastValid.match(/\[([a-z0-9]{8,})\]/);
+  if (sidMatch) lastSessionId = sidMatch[1];
+
+  // State detection
+  if (lastValid.includes('gateway.exit_clean') || lastValid.includes('gateway.shutdown')) {
+    setState('sleeping');
+  } else if (lastValid.includes('tool_executor') || lastValid.includes('tool_call')) {
+    setState('working');
+    lastActivity = Date.now();
+  } else if (lastValid.includes('conversation.turn:') || lastValid.includes('API call #')) {
+    setState('thinking');
+    lastActivity = Date.now();
+  } else if (lastValid.includes('Turn ended') || lastValid.includes('response_sent')) {
+    setState('happy');
+    lastActivity = Date.now();
+  } else if (lastValid.includes('error') || lastValid.includes('ERROR')) {
+    setState('angry');
+  }
+
+  // Idle -> sleeping after 2 min
+  if (Date.now() - lastActivity > 120000 && currentState !== 'sleeping') {
+    setState('sleeping');
+  }
+
+  updateDebug();
 }
 
-tick();
+function setState(s) {
+  if (currentState !== s) {
+    currentState = s;
+    walkFrameIdx = 0;
+  }
+}
+
+function updateDebug() {
+  debug.style.display = 'block';
+  const sid = lastSessionId ? lastSessionId.slice(0, 8) : 'none';
+  debug.textContent = `${currentState} | ${sid}`;
+}
+
+// ========== Animation Loop ==========
+function loop(ts) {
+  updateWalk(ts);
+  requestAnimationFrame(loop);
+}
+
+// ========== Start ==========
+updatePos();
+requestAnimationFrame(loop);
+startPolling();
+
+// Try to enable Capacitor filesystem bridge
+if (window.Capacitor) {
+  console.log('Capacitor detected');
+}
 </script>
 </body>
 </html>
