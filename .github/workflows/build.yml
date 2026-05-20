@@ -45,7 +45,7 @@ jobs:
 
       - name: Build APK
         run: |
-          cd pet-app/android
+          cd android
           chmod +x ./gradlew
           ./gradlew assembleDebug --no-daemon
 
