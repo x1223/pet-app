@@ -16,7 +16,6 @@
             android:theme="@style/AppTheme.Overlay"
             android:launchMode="singleTask"
             android:exported="true"
-            android:alwaysOnTop="true"
             android:resizeableActivity="true">
 
             <intent-filter>
