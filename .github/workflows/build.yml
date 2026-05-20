@@ -18,10 +18,17 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Cache node_modules
+        uses: actions/cache@v4
+        with:
+          path: pet-app/node_modules
+          key: npm-${{ hashFiles('pet-app/package-lock.json') }}
+          restore-keys: npm-
+
       - name: Install dependencies
         run: |
           cd pet-app
-          npm install
+          npm ci || npm install --prefer-offline
 
       - name: Sync Capacitor
         run: |
@@ -41,7 +48,7 @@ jobs:
         run: |
           cd pet-app/android
           chmod +x ./gradlew
-          ./gradlew assembleDebug
+          ./gradlew assembleDebug --no-daemon
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
