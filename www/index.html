@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Pet</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body {
+      width: 100%; height: 100%;
+      background: transparent;
+      overflow: hidden;
+      touch-action: none;
+    }
+    #canvas {
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      cursor: grab;
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+    }
+    #canvas:active { cursor: grabbing; }
+    #debug {
+      position: fixed;
+      top: 10px;
+      left: 10px;
+      color: white;
+      font: 12px monospace;
+      background: rgba(0,0,0,0.5);
+      padding: 4px 8px;
+      border-radius: 4px;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<div id="debug"></div>
+
+<script>
+// ========== Config ==========
+const LOG_PATH = '/data/data/com.termux/files/home/.hermes/logs/agent.log';
+const SPRITE_PATH = 'img/spritesheet.png';
+
+// Sprite sheet: 1408x768, 3 rows
+// Row 1 & 2: 6 cells × 234×256
+// Row 3: 12 smaller cells × 117×256
+const CELL_W = 234, CELL_H = 256;
+const SMALL_W = 117;
+
+// State → (row, col) 0-indexed
+const STATE_MAP = {
+  idle:      [0, 0],
+  thinking:  [0, 1],
+  angry:     [0, 2],
+  happy:     [0, 3],
+  working:   [0, 4],
+  swordplay: [0, 5],
+  building:  [1, 0],
+  conducting:[1, 1],
+  notice:    [1, 2],
+  sweeping:  [1, 3],
+  carrying:  [1, 4],
+  sleeping:  [1, 5],
+};
+
+// ========== State ==========
+let currentState = 'idle';
+let frameIdx = 0;
+let animTimer = 0;
+let petX = 0, petY = 0;
+let dragging = false, dragOffX = 0, dragOffY = 0;
+let lastActivity = Date.now();
+let lastSessionId = null;
+
+// ========== Canvas ==========
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const debug = document.getElementById('debug');
+
+// Scale: display at 50% of cell size (117×128 fits nicely)
+const SCALE = 0.5;
+const DISP_W = Math.floor(CELL_W * SCALE);
+const DISP_H = Math.floor(CELL_H * SCALE);
+
+canvas.width = DISP_W;
+canvas.height = DISP_H;
+
+// Position bottom-right initially
+petX = window.innerWidth - DISP_W - 40;
+petY = window.innerHeight - DISP_H - 40;
+
+// ========== Sprite Sheet ==========
+const sheet = new Image();
+let frames = [];
+let framesSmall = [];
+let loaded = false;
+
+sheet.onload = () => {
+  // Extract row 1 & 2 (6 cells each)
+  for (let row = 0; row < 2; row++) {
+    for (let col = 0; col < 6; col++) {
+      const c = document.createElement('canvas');
+      c.width = CELL_W; c.height = CELL_H;
+      const cx = c.getContext('2d');
+      cx.drawImage(sheet, col * CELL_W, row * CELL_H, CELL_W, CELL_H, 0, 0, CELL_W, CELL_H);
+      frames.push(c);
+    }
+  }
+  // Row 3: 12 smaller cells
+  for (let col = 0; col < 12; col++) {
+    const c = document.createElement('canvas');
+    c.width = SMALL_W; c.height = CELL_H;
+    const cx = c.getContext('2d');
+    cx.drawImage(sheet, col * SMALL_W, 2 * CELL_H, SMALL_W, CELL_H, 0, 0, SMALL_W, CELL_H);
+    framesSmall.push(c);
+  }
+  loaded = true;
+  requestAnimationFrame(draw);
+};
+sheet.src = SPRITE_PATH;
+
+// ========== Draw ==========
+function draw() {
+  if (!loaded) { requestAnimationFrame(draw); return; }
+
+  ctx.clearRect(0, 0, DISP_W, DISP_H);
+
+  const [row, col] = STATE_MAP[currentState] || [0, 0];
+  let fi;
+  if (row < 2) {
+    fi = row * 6 + col;
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(frames[fi], 0, 0, DISP_W, DISP_H);
+  }
+
+  requestAnimationFrame(draw);
+}
+
+// ========== Drag ==========
+canvas.addEventListener('pointerdown', e => {
+  dragging = true;
+  dragOffX = e.clientX - petX;
+  dragOffY = e.clientY - petY;
+  canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener('pointermove', e => {
+  if (!dragging) return;
+  petX = e.clientX - dragOffX;
+  petY = e.clientY - dragOffY;
+  updatePos();
+});
+canvas.addEventListener('pointerup', () => { dragging = false; });
+
+function updatePos() {
+  canvas.style.right = 'auto';
+  canvas.style.bottom = 'auto';
+  canvas.style.left = petX + 'px';
+  canvas.style.top = petY + 'px';
+}
+
+// ========== Log Polling ==========
+const LOG_POLL_MS = 2000;
+let lastLogPos = 0;
+
+async function pollLog() {
+  try {
+    const resp = await fetch('file://' + LOG_PATH);
+    if (!resp.ok) return;
+    const text = await resp.text();
+    const lines = text.split('\n');
+    
+    // Find last session ID and state
+    let lastLine = '';
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (lines[i].includes('[') && lines[i].includes(']')) {
+        lastLine = lines[i];
+        break;
+      }
+    }
+
+    if (lastLine.includes('gateway.start')) {
+      const m = lastLine.match(/\[([a-z0-9]+)\]/);
+      if (m) lastSessionId = m[1];
+    }
+    if (lastLine.includes('gateway.exit_clean')) {
+      currentState = 'sleeping';
+    }
+    if (lastLine.includes('conversation turn:') || lastLine.includes('API call #')) {
+      currentState = 'thinking';
+      lastActivity = Date.now();
+    }
+    if (lastLine.includes('tool_executor:')) {
+      currentState = 'working';
+      lastActivity = Date.now();
+    }
+    if (lastLine.includes('Turn ended:')) {
+      currentState = 'happy';
+      lastActivity = Date.now();
+    }
+
+    // Idle -> sleeping after 2 min
+    if (Date.now() - lastActivity > 120000 && currentState !== 'sleeping') {
+      currentState = 'sleeping';
+    }
+
+    // Update debug
+    debug.style.display = 'block';
+    debug.textContent = `${currentState} | ${(lastSessionId || 'none').slice(0,8)}`;
+  } catch (e) {
+    // fetch may fail on file://, ignore
+  }
+}
+
+// ========== Animation Tick ==========
+function tick() {
+  animTimer++;
+  // Advance frame every ~1s for multi-frame states
+  const delays = { sleeping: 60, thinking: 40, working: 15, happy: 30, idle: 30 };
+  const delay = delays[currentState] || 30;
+  if (animTimer >= delay) {
+    animTimer = 0;
+    // Currently just redraws (single frame per state)
+    // Could add row-3 walk cycle animation here
+  }
+  pollLog();
+  setTimeout(tick, 1000);
+}
+
+tick();
+</script>
+</body>
+</html>

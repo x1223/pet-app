@@ -1,0 +1,5 @@
+{
+  "appId": "com.termux.pet",
+  "appName": "PetApp",
+  "webDir": "www"
+}
